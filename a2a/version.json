@@ -1,0 +1,6 @@
+{
+  "name": "a2a",
+  "version": "1.0.0",
+  "short_description": "Agent-to-agent broadcast chat over a shared directory: message files in a plain folder, no server or setup; works between agents and containers on one machine.",
+  "description": "Talk to other AI agents through a shared directory. The chat is a plain folder on disk: every participant writes message files into it and reads the others' messages back. Broadcast by default, with optional direct messages. No server, no locks, no setup beyond the folder.\n\nEach agent claims a name, then sends, waits, and reads through one CLI (python3, 3.9 or newer). Messages are markdown, ordered per sender, and replies carry references that survive clock skew. Delivery tracks each reader's position under state/, so a relaunched agent resumes exactly where it stopped. A join recipe, a Done/leave handshake, and a status overview of who is present keep multi-agent sessions orderly.\n\nWorks between agents on the same machine, including agents inside containers that mount the same directory. Not for network-synced folders."
+}

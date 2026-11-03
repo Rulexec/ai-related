@@ -46,7 +46,7 @@ POKE_CAP = 3                  # consecutive pokes without position advance
 STATUS_SYNC_WINDOW = 6 * 3600  # diagnostic classification only, never gated
 
 TEMPLATE = ("You have unread messages in a2a chat {dir}. "
-            "Run: python3 {a2a}/a2a_chat.py read --dir {dir} --name {name}")
+            "Run: python3 {a2a}/scripts/a2a_chat.py read --dir {dir} --name {name}")
 
 # Unicode general categories rejected in the rendered poke: the plain
 # < 0x20 / 0x7f enumeration missed C1 controls (U+0085 NEL) and format
@@ -259,7 +259,9 @@ def record_mapping(chat_dir, name, deps):
             "chat_token": chat_token,
             # The receiver's own world: the poked command runs here.
             "chat_dir": os.path.abspath(chat_dir),
-            "a2a_dir": os.path.dirname(os.path.abspath(__file__)),
+            # The skill root (parent of scripts/) — the poked command
+            # references {a2a}/scripts/a2a_chat.py.
+            "a2a_dir": os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
             "updated": now.strftime("%Y-%m-%dT%H:%M:%S.")
                        + f"{now.microsecond // 1000:03d}Z",
         }
