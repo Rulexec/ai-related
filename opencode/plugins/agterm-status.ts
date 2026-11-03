@@ -1,4 +1,5 @@
-import type { Plugin, PluginInput } from "@opencode-ai/plugin"
+import { spawn } from "node:child_process"
+import type { Plugin } from "@opencode-ai/plugin"
 
 // ============================================================
 // agterm Session Status Plugin
@@ -10,50 +11,90 @@ import type { Plugin, PluginInput } from "@opencode-ai/plugin"
 // When AGTERM_SESSION_ID is unset, the plugin returns {} (no
 // hooks) — a complete no-op with zero overhead.
 //
-// Three design choices prevent stale "active" status:
+// Design choices:
 //
-// 1. Serial queue — setStatus calls are chained onto a single
-//    promise queue so no two agtermctl subprocesses run
-//    concurrently. This prevents out-of-order completion where
-//    an "active" call finishes after a "completed" call.
+// 1. Serial queue + bounded spawn — setStatus calls are chained
+//    onto a single promise queue so no two agtermctl subprocesses
+//    run concurrently. This prevents out-of-order completion where
+//    an "active" call finishes after a "completed" call. Each
+//    spawn is bounded: after 10s the whole process group gets
+//    SIGTERM (detached + kill(-pid)), so a hung agtermctl cannot
+//    stall the queue forever.
 //
 // 2. Root session filter — only root sessions (no parentID)
-//    are tracked and mirrored for session.status events.
-//    Subagent sessions emit their own session.status events
-//    through the same pipeline; without filtering, a background
-//    subagent's "busy" event could overwrite the root session's
-//    "completed" status.
+//    are tracked and mirrored for session.status/session.error
+//    events. Subagent sessions emit their own events through the
+//    same pipeline; without filtering, a background subagent's
+//    "busy" event could overwrite the root session's "completed"
+//    status.
 //
-// 3. Permission/question asks from ANY session in the tree
-//    (root or subagent) set the status to "blocked". A
-//    pendingAsks counter tracks unresolved asks across the
-//    whole tree — the status returns to "active" only when
-//    the counter reaches zero. This handles subagent asks
-//    (whose sessionID is the child's, not the root's) and
-//    concurrent asks from multiple subagents.
+// 3. Turn-ending errors block — a session.error on a tracked root
+//    session sets "blocked" and latches the session: the idle
+//    published right after the error is swallowed, so a failed
+//    turn does not end up reported as "completed". Aborts are not
+//    failures (Esc routes through halt(DOMException AbortError),
+//    parsed to MessageAbortedError — either name may surface) and
+//    fall through to the following idle → "completed". The latch
+//    clears on the next busy/retry.
+//
+// 4. Permission/question asks from ANY session in the tree (root
+//    or subagent) set the status to "blocked". Pending asks are
+//    tracked by request id; the status returns to "active" only
+//    when the last one is answered. An interrupted turn drops its
+//    asks without reply events, so a root session's idle sweeps
+//    the pending set — an ask can never leak the "blocked" state
+//    forever.
 // ============================================================
 
-export default (async ({ $ }: PluginInput) => {
+// Interrupts are not failures: Esc routes through halt(DOMException AbortError),
+// which is parsed to MessageAbortedError — either name may surface.
+const ABORT_ERROR_NAMES = new Set(["MessageAbortedError", "AbortError"])
+
+// A hung agtermctl must not stall the status queue: every spawn is bounded,
+// and the whole process group is SIGTERMed when the bound expires.
+const SPAWN_TIMEOUT_MS = 10_000
+
+export default (async () => {
   const sessionId = process.env.AGTERM_SESSION_ID
   if (!sessionId) return {}
+
+  const runAgtermctl = (state: string): Promise<void> =>
+    new Promise((resolve) => {
+      let settled = false
+      const finish = () => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        resolve()
+      }
+      const child = spawn("agtermctl", ["session", "status", state, "--target", sessionId], {
+        stdio: "ignore",
+        env: process.env,
+        detached: true,
+      })
+      child.on("error", finish)
+      child.on("close", finish)
+      const timer = setTimeout(() => {
+        try {
+          if (child.pid != null) process.kill(-child.pid, "SIGTERM")
+        } catch {
+          // already gone
+        }
+        finish()
+      }, SPAWN_TIMEOUT_MS)
+    })
 
   let queue: Promise<void> = Promise.resolve()
 
   const setStatus = (state: string): void => {
-    queue = queue.then(async () => {
-      try {
-        await $`agtermctl session status ${state} --target ${sessionId}`
-          .quiet()
-          .nothrow()
-      } catch {
-        // silent — never crash opencode
-      }
-    })
-    queue.catch(() => {})
+    // silent — never crash opencode
+    queue = queue.then(() => runAgtermctl(state)).catch(() => {})
   }
 
   const rootSessions = new Set<string>()
-  let pendingAsks = 0
+  const erroredSessions = new Set<string>()
+  // request ids of permission/question asks still waiting for an answer
+  const pendingAsks = new Set<string>()
 
   return {
     event: async ({
@@ -82,9 +123,31 @@ export default (async ({ $ }: PluginInput) => {
         if (rootSessions.size === 0) rootSessions.add(sid)
         if (!rootSessions.has(sid)) return
         const statusType = event.properties?.status?.type
-        if (statusType === "busy") setStatus("active")
-        else if (statusType === "idle") setStatus("completed")
-        else if (statusType === "retry") setStatus("blocked")
+        if (statusType === "busy" || statusType === "retry") {
+          // work (re)started — a latched error no longer applies
+          erroredSessions.delete(sid)
+          setStatus(statusType === "busy" ? "active" : "blocked")
+        } else if (statusType === "idle") {
+          // an interrupted turn drops its asks without reply events, so idle
+          // is what clears them (root idle ends the whole tree's turn)
+          pendingAsks.clear()
+          // swallow the idle published right after a latched error so the
+          // "blocked" sticks instead of flipping to "completed"
+          if (erroredSessions.delete(sid)) return
+          setStatus("completed")
+        }
+        return
+      }
+
+      if (type === "session.error") {
+        const sid = event.properties?.sessionID
+        // unattributed errors and subagent errors don't drive the root
+        // indicator (the root turn reports its own outcome)
+        if (!sid || !rootSessions.has(sid)) return
+        // interrupts are not failures — the following idle reports "completed"
+        if (ABORT_ERROR_NAMES.has(event.properties?.error?.name)) return
+        erroredSessions.add(sid)
+        setStatus("blocked")
         return
       }
 
@@ -92,10 +155,11 @@ export default (async ({ $ }: PluginInput) => {
       // subagent) block the agterm indicator. The sessionID on these events
       // is the session that raised the ask — for subagent asks this is the
       // child session ID, so the rootSessions filter must NOT be applied
-      // here. A pendingAsks counter tracks unresolved asks so the status
-      // returns to "active" only when all asks are resolved.
+      // here. Replies are matched by request id; the status returns to
+      // "active" only when all asks are resolved.
       if (type === "permission.asked" || type === "question.asked") {
-        pendingAsks++
+        const id = event.properties?.id
+        if (typeof id === "string") pendingAsks.add(id)
         setStatus("blocked")
         return
       }
@@ -105,8 +169,8 @@ export default (async ({ $ }: PluginInput) => {
         type === "question.replied" ||
         type === "question.rejected"
       ) {
-        pendingAsks = Math.max(0, pendingAsks - 1)
-        if (pendingAsks === 0) setStatus("active")
+        pendingAsks.delete(event.properties?.requestID)
+        if (pendingAsks.size === 0) setStatus("active")
         return
       }
     },
