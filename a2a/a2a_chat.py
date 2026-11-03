@@ -15,22 +15,35 @@ Commands:
                                            if the name is taken: position
                                            exists or it has spoken)
     send    --dir Y --name Q --file F [--file F ...] [--to NAME]
-                                           [--wait [S]]
-                                            commit messages ('-' = stdin,
-                                            single); --to makes them direct
-                                            (delivered only to NAME); with
-                                            --wait also wait
-                                            for answers, skipping your own
+                                            [--wait [S]] [--no-poke]
+                                             commit messages ('-' = stdin,
+                                             single); --to makes them direct
+                                             (delivered only to NAME); with
+                                             --wait also wait
+                                             for answers, skipping your own;
+                                             --no-poke skips the automatic
+                                             agterm poke pass (agterm panes
+                                             only; automatic elsewhere is
+                                             a no-op by design)
     wait    --dir Y --name Q [--timeout S] [--ignore ID [ID ...]]
-                                           [--ignore-own-through ID]
-                                           block until new messages
-                                           (default 300s); --ignore marks
-                                           messages as read without
-                                           printing; --ignore-own-through
-                                           skips all your messages up to
-                                           and including ID
+                                            [--ignore-own-through ID]
+                                            block until new messages
+                                            (default 300s); --ignore marks
+                                            messages as read without
+                                            printing; --ignore-own-through
+                                            skips all your messages up to
+                                            and including ID
     read    --dir Y --name Q [--all]      deliver new messages now / print history
     status  --dir Y                       chat summary (senders + known readers)
+    wake    --dir Y --name Q [--force]    manually poke an idle agterm peer
+                                           (human-facing; cooldown/cap are
+                                           not consulted, full safety gate
+                                           applies; exit 3 = nothing pending,
+                                           5 = refused/no mapping)
+    unlink  --dir Y --name Q               erase Q's agterm session mapping
+                                           so pokes to it stop (human-facing;
+                                           Q re-links on its next chat
+                                           command; exit 3 = no mapping)
 
 Exit codes:
     0  success   2  usage error   3  nothing new (wait timeout / empty read)
@@ -451,6 +464,43 @@ def coalesce_burst(chat_dir, name, pending):
 # --------------------------------------------------------------------------
 # Commands
 
+def _chat_token(chat_dir):
+    """The chat's identity token (chat.json 'created'); None-safe."""
+    try:
+        if not os.path.isfile(os.path.join(chat_dir, CHAT_FILE)):
+            return None
+        return read_chat_meta(chat_dir).get("created")
+    except Exception:
+        return None
+
+
+def _agterm_deps():
+    """Single construction point for the injected agterm callables (the
+    same function objects this running module uses — structural, not a
+    copy). Fully silent on ImportError: config problems are never
+    agent-facing."""
+    try:
+        import agterm
+        return agterm, agterm.Deps(deliverable_to=deliverable_to,
+                                   scan_messages=scan_messages,
+                                   load_seen=load_seen,
+                                   atomic_write=atomic_write_json,
+                                   chat_token=_chat_token)
+    except ImportError:
+        return None, None
+
+
+def _record_mapping(chat_dir, name):
+    """Record the caller's agterm mapping at command start, before any
+    blocking wait. Name is argparse-validated; the explicit NAME_RE
+    check guards programmatic callers (defense in depth)."""
+    if not NAME_RE.match(name):
+        return
+    module, deps = _agterm_deps()
+    if module is not None:
+        module.record_mapping(chat_dir, name, deps)
+
+
 def init_chat(chat_dir, topic=None):
     """Create the chat structure; raises ValueError on conflicts."""
     if os.path.isfile(chat_dir):
@@ -502,6 +552,7 @@ def resolve_body_path(chat_dir, path):
 
 def cmd_send(args):
     require_chat(args.dir)
+    _record_mapping(args.dir, args.name)
     files = list(args.file)
     # Input phase (all-or-nothing): resolve and read every body before
     # committing anything, so one bad file leaves zero messages behind —
@@ -518,6 +569,11 @@ def cmd_send(args):
     else:
         paths = [resolve_body_path(args.dir, f) for f in files]
         bodies = [read_body_file(path) for path in paths]
+    # An empty body is almost certainly a lost stdin/pipe (seen live:
+    # a piped ack landed headers-only) — refuse before committing.
+    for source, body in zip(files, bodies):
+        if not body.strip():
+            die(EXIT_USAGE, f"--file {source}: message body is empty")
     # Commit phase: back-to-back.
     mids = []
     try:
@@ -529,6 +585,12 @@ def cmd_send(args):
         die(EXIT_ERROR, str(e))
     for mid in mids:
         print(f"sent {mid}")
+    # Poke pass: after the batch is committed and printed, before any
+    # blocking --wait. Never fatal, never blocks beyond its own budget.
+    if not args.no_poke:
+        module, deps = _agterm_deps()
+        if module is not None:
+            module.after_send(args.dir, args.name, deps)
     if args.wait is None:
         return EXIT_OK
     # --wait: treat the whole just-sent batch as read, then wait.
@@ -569,6 +631,7 @@ def own_through_ids(chat_dir, name, through_id):
 
 def cmd_wait(args):
     require_chat(args.dir)
+    _record_mapping(args.dir, args.name)
     if args.timeout < 0:
         die(EXIT_USAGE, "--timeout must be >= 0")
     try:
@@ -602,6 +665,7 @@ def cmd_read(args):
         return EXIT_OK
     if not args.name:
         die(EXIT_USAGE, "read: --name is required unless --all is given")
+    _record_mapping(args.dir, args.name)
     try:
         count = deliver_messages(args.dir, args.name, 0.0)
     except OSError as e:
@@ -634,6 +698,38 @@ def cmd_read(args):
                   f"a fresh name", file=sys.stderr)
         return EXIT_TIMEOUT
     return EXIT_OK
+
+
+def cmd_wake(args):
+    """Human-facing manual poke (loud; agterm-module command).
+
+    Bypasses cooldown and cap (explicit intent), runs the full safety
+    gate, writes the cooldown record. Exit 0 poked / 3 nothing pending
+    / 5 refused; SKILL.md stays mechanism-free on agterm — unlink is
+    documented there behavior-only, nothing else.
+    """
+    require_chat(args.dir)
+    module, deps = _agterm_deps()
+    if module is None or deps is None:
+        die(EXIT_ERROR, "agterm module unavailable")
+    return module.wake(args.dir, args.name, args.force, deps)
+
+
+def cmd_unlink(args):
+    """Human-facing mapping removal (loud; agterm-module command).
+
+    Erases state/<name>.agterm.json so the chat stops poking that
+    participant until it interacts again — its next send/wait/read
+    re-records the mapping (accepted, documented; nothing to undo by
+    hand). Records no mapping itself (the caller may be the human;
+    unlink is not a chat interaction). Exit 0 unlinked / 3 no mapping
+    / 5 error.
+    """
+    require_chat(args.dir)
+    module, deps = _agterm_deps()
+    if module is None or deps is None:
+        die(EXIT_ERROR, "agterm module unavailable")
+    return module.unlink(args.dir, args.name)
 
 
 def cmd_claim(args):
@@ -781,6 +877,9 @@ def build_parser():
                    default=None, metavar="SEC",
                    help="after sending, wait up to SEC seconds (default 300) "
                         "for new messages; your own messages are skipped")
+    p.add_argument("--no-poke", action="store_true",
+                   help="skip the automatic agterm poke pass after sending "
+                        "(agterm panes only; no effect elsewhere)")
     p.set_defaults(func=cmd_send)
 
     p = sub.add_parser("wait", help="block until new messages arrive")
@@ -810,6 +909,22 @@ def build_parser():
     p = sub.add_parser("status", help="chat summary")
     p.add_argument("--dir", required=True, help="chat directory")
     p.set_defaults(func=cmd_status)
+
+    p = sub.add_parser("wake", help="manually poke an idle agterm peer "
+                                     "(human-facing; full safety gate applies)")
+    p.add_argument("--dir", required=True, help="chat directory")
+    p.add_argument("--name", required=True, type=valid_name,
+                    help="name of the peer to poke")
+    p.add_argument("--force", action="store_true",
+                    help="poke even with nothing pending for the name")
+    p.set_defaults(func=cmd_wake)
+
+    p = sub.add_parser("unlink", help="stop poking an agterm peer: remove "
+                                       "its session mapping (human-facing)")
+    p.add_argument("--dir", required=True, help="chat directory")
+    p.add_argument("--name", required=True, type=valid_name,
+                    help="name of the peer to stop poking")
+    p.set_defaults(func=cmd_unlink)
 
     return parser
 

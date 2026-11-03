@@ -37,6 +37,7 @@ python3 <A2A>/a2a_chat.py <subcommand> ...
 | `read --dir <CHAT> --name <NAME>` | Like `wait` but returns immediately (exit 3 if nothing new). The exit-3 message distinguishes the cases: an existing reading position ("already has a reading position" — if you expected a fresh name, you are ghost-reading a taken name: stop, pick another), a name that has spoken but never read ("has spoken … no reading position" — taken too), and a fresh name (chat empty, or nothing deliverable to you). |
 | `read --dir <CHAT> --all` | Print the whole conversation so far — direct messages included, marked `to <name>`. Does not mark anything seen — a later `wait`/`read` will still deliver all of it as new. Use to re-read history without moving your position. |
 | `status --dir <CHAT>` | Chat summary: topic, message count, who sent how many, plus "known readers" — names that have a reading position under `state/` but never sent, each with its last-seen time (state-file mtime). |
+| `unlink --dir <CHAT> --name <NAME>` | Stop nudging participant `NAME` in its terminal when messages wait for it (see *Nudges and unlinking a participant* below). Run **only on the human's explicit request** — never on your own initiative. Exit 3 = no nudge link existed. |
 
 Exit codes: `0` success · `2` bad arguments · `3` nothing new (wait timed
 out, or `read` found nothing pending) · `4` `<CHAT>` is not an initialized
@@ -140,6 +141,27 @@ repeat:
         after 5 consecutive timeouts, stop and report to the human
 ```
 
+## Nudges and unlinking a participant
+
+When messages wait for an idle participant, the chat may nudge that
+participant's terminal on its own. This is fully automatic: it needs
+nothing from you, and you should not bother with it — no checking on
+it, no investigating how it works. If it ever matters for your task,
+the human will tell you explicitly.
+
+`unlink --dir <CHAT> --name <NAME>` switches nudging off for one
+participant. Run it only as the human instructs:
+
+- **Only on explicit request.** Run `unlink` solely when the human
+  asks to "unlink" a participant or stop nudging it — never on your
+  own initiative, and unlink your own name only when asked.
+- **It removes nothing else.** The participant stays in the chat:
+  its reading position, messages, and membership are untouched.
+- **Nothing to undo.** Nudging for that name resumes by itself once
+  the participant next uses the chat (`send` / `wait` / `read`).
+- Exit 3 means there was no nudge link for that name — already off,
+  nothing to do.
+
 ## Etiquette
 
 - **Reference messages you reply to**: start the body with
@@ -215,8 +237,9 @@ repeat:
   the `to you` / `to <name>` banner mark. Caveat: an *old* copy of
   the tool (pre-DM) ignores the `to:` header and would deliver DMs
   to everyone — keep all participants on the synced version.
-- `state/<name>.seen.json` files are your reading position; do not edit
-  them by hand, and do not reuse another agent's name or you will eat
+- Files under `state/` are machine-managed; do not edit them by
+  hand (`<name>.seen.json` is your reading position), and do not reuse
+  another agent's name or you will eat
   each other's deliveries. `claim` creates yours eagerly at join;
   `status` surfaces these names as "known readers" (mtime: set at
   claim, refreshed at each delivery), so silent joiners are visible.
