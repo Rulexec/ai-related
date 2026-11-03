@@ -9,24 +9,39 @@ namespace (this module imports nothing from it — the running chat
 script may be a differently-installed copy, so cross-imports would bind
 to the wrong instance).
 
+Delivery mechanism: nudges travel on the agterm message bus
+(`agtermctl msg send`), never by typing into the receiver's composer.
+One nudge is one anonymous, versioned JSON payload addressed to the
+receiver's exact `SESSION:PANE-ID`; a receiver-side plugin (opencode
+TUI plugin) owns the mailbox: it reads, validates, acks, and wakes its
+idle session. The bus is queue-only — delivery wakes nobody — and a
+mailbox evaporates silently when its pane's program dies, so the poke
+pass never assumes durability: chat-side reading positions are the
+durable truth, and every send recomputes who still has undelivered
+mail and re-nudges within cooldown/cap.
+
+Sender-side identity stays gated (session-in-tree, program-not-shell,
+status completed, cwd pin, chat token, pane-ambiguity exclusion): the
+live pane id is resolved from the window tree and must equal the
+mapping's recorded pane id — drift means stale identity, fail closed.
+
 Failure policy in one breath: the automatic poke pass is fully
-silent — runtime failures (session gone, status not idle, busy
-composer, guards tripped, ctl errors, budget exhausted, ambiguous
-pane), config problems (no agterm, no ctl binary, no mappings), and
-mitigations (cooldown, re-poke cap, nothing pending) all skip that
-receiver without a word; `wake` is the loud, exit-coded diagnostic
-path. A failed or skipped poke never fails the enclosing chat command.
+silent — runtime failures (session gone, status not idle, guards
+tripped, ctl errors, budget exhausted, ambiguous pane, pane-id drift,
+bus rejection), config problems (no agterm, no ctl binary, no
+mappings), and mitigations (cooldown, re-poke cap, nothing pending)
+all skip that receiver without a word; `wake` is the loud, exit-coded
+diagnostic path. A failed or skipped poke never fails the enclosing
+chat command.
 """
 
 import json
 import os
 import re
-import shlex
 import shutil
 import subprocess
 import sys
 import time
-import unicodedata
 from collections import namedtuple
 from datetime import datetime, timezone
 
@@ -37,7 +52,7 @@ CTL_ENV = "AGTERMCTL"
 SESSION_ENV = "AGTERM_SESSION_ID"
 PANE_ENV = "AGTERM_PANE"
 WINDOW_ENV = "AGTERM_WINDOW_ID"   # every ctl call is frontmost-window-scoped
-PANE_ID_ENV = "AGTERM_PANE_ID"    # recorded additively; targeting hardening
+PANE_ID_ENV = "AGTERM_PANE_ID"    # recorded; cross-checked against the tree
 
 CTL_CALL_TIMEOUT = 2.0        # per agtermctl call
 POKE_BUDGET = 5.0             # total per send invocation
@@ -45,13 +60,16 @@ POKE_COOLDOWN = 10.0          # min seconds between pokes to one name
 POKE_CAP = 3                  # consecutive pokes without position advance
 STATUS_SYNC_WINDOW = 6 * 3600  # diagnostic classification only, never gated
 
-TEMPLATE = ("You have unread messages in a2a chat {dir}. "
-            "Run: python3 {a2a}/scripts/a2a_chat.py read --dir {dir} --name {name}")
-
-# Unicode general categories rejected in the rendered poke: the plain
-# < 0x20 / 0x7f enumeration missed C1 controls (U+0085 NEL) and format
-# chars (U+202E RTL override) that can reframe or reorder the line.
-CONTROL_CATEGORIES = frozenset({"Cc", "Cf", "Cs", "Co"})
+# The nudge payload contract with the receiver plugin. The plugin
+# filters its pane's shared mailbox by `type`, validates the payload's
+# chat_token against chat_dir's chat.json (accident hygiene — the
+# sender gates on the same token; any local bus sender could mint one,
+# so this is re-creation/staleness detection, not authentication),
+# acks, and prompts its idle session. `v` gates forward compatibility:
+# an unknown type or future v is ignored (and still acked — the plugin
+# is its pane's sole reader).
+NUDGE_TYPE = "a2a-nudge"
+NUDGE_VERSION = 1
 
 # Injected chat-engine callables: the *same function objects* the running
 # a2a_chat module uses (pending is computed by the delivery engine's own
@@ -61,43 +79,6 @@ Deps = namedtuple("Deps",
                   "deliverable_to scan_messages load_seen atomic_write chat_token")
 
 STATE_DIR = "state"
-
-# Composer geometry — pinned against captured live panes.
-# Bottom-up parse:
-#   edge row:    optional leading whitespace, "╹▀" prefix, trailing text
-#                tolerated (the wrapped cwd continues onto the edge row).
-#   anchor row:  box-internal ("┃"-prefixed) so rows like
-#                "▣ <agent> · <model> · <timer>" directly above the box
-#                are never candidates; content shape <word> · <model ...>.
-#   input rows:  every row from the anchor up to the box top must be
-#                blank (border glyph + whitespace), except right-status
-#                wrap segments (below). Transcript user messages share
-#                the "┃" border, so a transcript block above the
-#                composer reads "dirty" → skip (intended, fail-closed —
-#                the walk continues through blank rows, so "dirty"
-#                covers transcripts separated from the box by blanks
-#                too: deliberate over-detection, conservative
-#                direction). An inner side-by-side split separator
-#                intersecting the composer rows reads "ambiguous" → skip.
-#                Any parse ambiguity resolves to "absent".
-#   right-status wrap (live-pinned, OpenCode 1.19): the composer bar
-#                carries a right-aligned status text (cwd/branch) after
-#                the agent·model words. When long, it wraps with the
-#                leading segments on rows ABOVE the anchor row and only
-#                the last segment sharing the anchor row itself — the
-#                mirror image of the edge-row wrap. Those rows are
-#                chrome, not drafts: a box-text row is tolerated when
-#                its only content is a single text block starting at the
-#                same column as the anchor row's own trailing block
-#                (blocks are text groups split on runs of 2+ spaces; an
-#                anchor with no trailing block aligns nothing). Drafts
-#                start at the left input column, so alignment cannot
-#                mask them; a misaligned or multi-block row still reads
-#                "dirty" (fail-closed).
-EDGE_PREFIX = "╹▀"
-BORDER = "┃"
-SEPARATORS = frozenset("│▏▕┆┇┊┋")
-ANCHOR_RE = re.compile(r"^\S+\s+·\s+\S+")
 
 
 # --------------------------------------------------------------------------
@@ -165,6 +146,24 @@ def parse_tree(stdout):
     except Exception:
         return {}
     return sessions
+
+
+def surface_pane_id(node, pane):
+    """The bus pane id for `pane` ("left"/"right") from a session's
+    tree node: surfaces[].paneID where kind == pane — the same UUID as
+    the PANE-ID half of a bus address. None when the surface is
+    absent, not yet created (split hidden since launch), an overlay,
+    or malformed: omitted paneID is agterm's own "not addressable"
+    mark, and the caller fails closed."""
+    surfaces = node.get("surfaces") if isinstance(node, dict) else None
+    if not isinstance(surfaces, list):
+        return None
+    for surface in surfaces:
+        if (isinstance(surface, dict) and surface.get("kind") == pane
+                and isinstance(surface.get("paneID"), str)
+                and surface["paneID"]):
+            return surface["paneID"]
+    return None
 
 
 def _parse_status_age(value):
@@ -257,10 +256,11 @@ def record_mapping(chat_dir, name, deps):
             "status_sync": status_sync,
             "status_age_s": status_age_s,
             "chat_token": chat_token,
-            # The receiver's own world: the poked command runs here.
+            # The receiver's own world: the nudge payload references
+            # these, and the plugin validates against its own mapping.
             "chat_dir": os.path.abspath(chat_dir),
-            # The skill root (parent of scripts/) — the poked command
-            # references {a2a}/scripts/a2a_chat.py.
+            # The skill root (parent of scripts/) — the plugin renders
+            # the read command from {a2a_dir}/scripts/a2a_chat.py.
             "a2a_dir": os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
             "updated": now.strftime("%Y-%m-%dT%H:%M:%S.")
                        + f"{now.microsecond // 1000:03d}Z",
@@ -331,13 +331,15 @@ def gate(tree_sessions, mapping, own_chat_token):
 
     # 2. Program-not-shell (owner-relaxed: no argv parsing). The
     # basename == opencode check was demoted, not disproven; identity
-    # lives in the composer check.
+    # lives in the pane-id cross-check.
     fg_field = "splitForeground" if pane == "right" else "foreground"
     fg = node.get(fg_field)
     if not (isinstance(fg, list) and fg):
         return False, "not a program pane"
 
-    # 3. status == "completed" exactly; key-absent never pokes.
+    # 3. status == "completed" exactly; key-absent never pokes. The
+    # receiver plugin also idle-gates on its side — this is the cheap
+    # sender-side half that keeps mail out of busy sessions.
     if node.get("status") != "completed":
         return False, f"status {node.get('status') if 'status' in node else 'absent'}"
 
@@ -358,191 +360,88 @@ def gate(tree_sessions, mapping, own_chat_token):
 
 
 # --------------------------------------------------------------------------
-# Composer parsing — the identity and input-target gate
+# Nudge payload and bus delivery
 
-def _row_kind(row):
-    """Classify one rendered row for the bottom-up parse."""
-    stripped = row.strip()
-    if not stripped:
-        return "blank"
-    if SEPARATORS & set(stripped):
-        # An inner side-by-side split separator intersecting the composer
-        # rows (the content right of it belongs to the other pane).
-        # Contains-any, not column-consistency: a row merely *holding*
-        # a separator glyph classifies here too — deliberate
-        # over-detection (e.g. an exotic cwd containing the glyph reads
-        # absent, not empty). Missed pokes are the conservative failure.
-        return "separator"
-    if stripped.startswith(BORDER):
-        content = stripped.lstrip(BORDER).strip()
-        if not content:
-            return "box-blank"
-        if ANCHOR_RE.match(content):
-            return "anchor"
-        return "box-text"
-    return "text"
-
-
-def _content_start(row):
-    """Character offset of the content after the border glyph, None when
-    the row does not open with one (leading whitespace tolerated).
-    Offsets are Python character positions — alignment compares rows of
-    one capture, so code points are the consistent unit."""
-    stripped = row.lstrip()
-    if not stripped.startswith(BORDER):
-        return None
-    return len(row) - len(stripped) + len(BORDER)
-
-
-def _blocks(row):
-    """(start, end) character spans of the row's text blocks — maximal
-    non-space runs grouped across single spaces, split on whitespace
-    runs of 2+. Words of one phrase (agent · model, a path) stay a
-    single block; the composer's right status is its own block."""
-    start = _content_start(row)
-    if start is None:
-        return []
-    blocks = []
-    run_start = None
-    run_end = None
-    i = start
-    n = len(row)
-    while i < n:
-        if row[i].isspace():
-            j = i
-            while j < n and row[j].isspace():
-                j += 1
-            if run_start is not None and j - i >= 2:
-                blocks.append((run_start, run_end))
-                run_start = None
-            i = j
-        else:
-            j = i
-            while j < n and not row[j].isspace():
-                j += 1
-            if run_start is None:
-                run_start = i
-            run_end = j
-            i = j
-    if run_start is not None:
-        blocks.append((run_start, run_end))
-    return blocks
-
-
-def _trailing_block_col(anchor_row):
-    """Start column of the anchor row's trailing right-status block, or
-    None. The last of its 2+-space-separated blocks — but only when the
-    row carries more than one: a lone block is the agent·model text
-    itself (no right status rendered), and a lone block never licenses
-    tolerating anything above."""
-    blocks = _blocks(anchor_row)
-    if len(blocks) < 2:
-        return None
-    return blocks[-1][0]
-
-
-def _sole_block_col(row):
-    """Start column of the row's only text block, None unless the row
-    carries exactly one block (blank left area, single right block)."""
-    blocks = _blocks(row)
-    if len(blocks) != 1:
-        return None
-    return blocks[0][0]
-
-
-def composer_state(lines):
-    """"empty" | "dirty" | "absent" | "ambiguous" — see the geometry
-    note above the constants. Any ambiguity resolves to "absent";
-    anything readable in the input rows is "dirty"."""
-    try:
-        return _composer_state(list(lines))
-    except Exception:
-        return "absent"
-
-
-def _composer_state(lines):
-    # Edge: bottom-most row with the ╹▀ prefix after leading whitespace.
-    edge_idx = None
-    for i in range(len(lines) - 1, -1, -1):
-        if lines[i].lstrip().startswith(EDGE_PREFIX):
-            edge_idx = i
-            break
-    if edge_idx is None:
-        return "absent"
-
-    # Anchor: nearest box row above the edge whose content matches the
-    # shape. Rows between (wrapped bottom-bar continuation) are tolerated;
-    # non-box rows (e.g. the ▣ timer row) are skipped, never candidates.
-    anchor_idx = None
-    for i in range(edge_idx - 1, -1, -1):
-        if _row_kind(lines[i]) == "anchor":
-            anchor_idx = i
-            break
-    if anchor_idx is None:
-        return "absent"
-
-    # Input rows: walk up from the anchor while rows are box rows or
-    # blanks. Transcript user messages share the border → box-text →
-    # dirty. A split separator intersecting the composer → ambiguous.
-    # Right-status wrap segments (geometry note above) are chrome: a
-    # box-text row whose sole content aligns with the anchor's own
-    # trailing block passes; everything else stays dirty, fail-closed.
-    trailing_col = _trailing_block_col(lines[anchor_idx])
-    for i in range(anchor_idx - 1, -1, -1):
-        kind = _row_kind(lines[i])
-        if kind in ("box-blank", "blank"):
-            continue
-        if kind == "separator":
-            return "ambiguous"
-        if kind in ("box-text", "anchor", "text"):
-            if kind == "text":
-                break  # out-of-box row: the box top is below it
-            if (kind == "box-text" and trailing_col is not None
-                    and _sole_block_col(lines[i]) == trailing_col):
-                continue  # wrapped right-status chrome, column-aligned
-            return "dirty"
-        break
-    return "empty"
-
-
-# --------------------------------------------------------------------------
-# Template and the injection guards
-
-def render_poke(mapping, name):
-    """The fixed one-line instruction in the RECEIVER's world: dir/a2a
-    are the receiver's recorded absolute paths (container mount points
-    differ from the host's), shlex-quoted. Refuses (None) when either
-    recorded path is absent — a corrupt or forged mapping must fail
-    closed, not type a broken command (empty strings are category-clean
-    and bang-free, so the guards alone would let them through)."""
+def render_nudge(mapping, name):
+    """The nudge payload — one compact JSON line, the entire sender
+    side of the receiver contract: {type, v, chat_dir, a2a_dir, name,
+    chat_token}. Refuses (None) when a recorded receiver path or the
+    chat token is absent: a corrupt or forged mapping must fail closed,
+    never ship a payload the plugin would render against missing paths
+    (the gate refuses token-less mappings first, so this is the belt to
+    that braces)."""
     chat_dir = mapping.get("chat_dir")
     a2a_dir = mapping.get("a2a_dir")
-    if not chat_dir or not a2a_dir:
+    chat_token = mapping.get("chat_token")
+    if not chat_dir or not a2a_dir or not chat_token or not name:
         return None
-    return TEMPLATE.format(dir=shlex.quote(str(chat_dir)),
-                           a2a=shlex.quote(str(a2a_dir)),
-                           name=name)
+    return json.dumps({
+        "type": NUDGE_TYPE,
+        "v": NUDGE_VERSION,
+        "chat_dir": str(chat_dir),
+        "a2a_dir": str(a2a_dir),
+        "name": str(name),
+        "chat_token": str(chat_token),
+    }, separators=(",", ":"), sort_keys=True)
 
 
-def bytes_safe(rendered):
-    """No character of category Cc/Cf/Cs/Co anywhere; the submit newline
-    we append is not part of the check."""
-    return all(unicodedata.category(c) not in CONTROL_CATEGORIES
-               for c in rendered)
+def reply_lists_target(entries, target):
+    """True when the send reply's delivered/rejected list names our
+    target; matching on the pane-id half absorbs canonical-address
+    spelling differences."""
+    if not isinstance(entries, list):
+        return False
+    pane_half = target.split(":", 1)[1] if ":" in target else target
+    for entry in entries:
+        if isinstance(entry, str) and (
+                entry == target or entry.endswith(":" + pane_half)):
+            return True
+    return False
 
 
-def bang_safe(rendered):
-    """No "!" anywhere: a bang riding a keystroke burst routes the line
-    to shell execution via eval in the typed surface (live-observed).
-    Substituted paths are participant-writable, so the rule applies to
-    the rendered bytes, not just the constant."""
-    return "!" not in rendered
-
-
-def template_constant_safe():
-    """First line of defense: the TEMPLATE constant itself — no "!",
-    first character a letter."""
-    return "!" not in TEMPLATE and TEMPLATE[:1].isalpha()
+def deliver_nudge(ctl, mapping, name, node, timeout):
+    """One nudge attempt over the bus. Returns (ok, reason); ok=True
+    iff the bus accepted the payload for the receiver's mailbox —
+    which is also the moment the caller records the poke. Counting is
+    reply-first, exit-code-second (bus semantics: a nonzero exit only
+    means *something* was rejected — a partial send still queues the
+    listed recipients' copies, so exit-1-with-our-recipient-delivered
+    is a counted poke; only transport-level failures fail closed).
+    Also fail-closed on: unaddressable surface (no paneID), stale
+    identity (tree pane id != recorded pane id — a re-split or
+    respawn; the mailbox is gone anyway), missing receiver paths,
+    explicit rejection (unknown pane / mailbox full)."""
+    pane = mapping.get("pane")
+    pane_id = surface_pane_id(node, pane)
+    if not pane_id:
+        return False, f"no paneID for surface {pane!r} in tree"
+    recorded = mapping.get("pane_id")
+    if not isinstance(recorded, str) or not recorded:
+        return False, "no pane id in mapping"
+    if pane_id != recorded:
+        return False, f"pane id drift (tree {pane_id}, mapping {recorded})"
+    payload = render_nudge(mapping, name)
+    if payload is None:
+        return False, "no receiver paths in mapping"
+    target = f"{mapping.get('session_id')}:{pane_id}"
+    ok, out, err = run_ctl(ctl, ["msg", "send", "--stdin", "--to", target],
+                           timeout, stdin=payload)
+    try:
+        reply = json.loads(out)
+    except Exception:
+        reply = None
+    if isinstance(reply, dict):
+        if reply_lists_target(reply.get("delivered"), target):
+            return True, ""
+        if reply_lists_target(reply.get("rejected"), target):
+            return False, f"bus rejected {target}"
+    # Our target is in neither list (single-recipient sends land here
+    # only on odd replies) or the reply is unparsable: exit 0 means
+    # the queue accepted it (rejected panes are named, not implied);
+    # nonzero is the transport-level fail-closed skip.
+    if ok:
+        return True, ""
+    return False, f"agtermctl failed: {err.strip() or 'unknown'}"
 
 
 # --------------------------------------------------------------------------
@@ -584,10 +483,13 @@ def poke_allowed(chat_dir, name, deps, now=None):
 
 
 def record_poke(chat_dir, name, deps, now=None):
-    """After a successful type only: timestamp + delivery counter.
-    The counter tracks *consecutive pokes without reader progress* —
-    when the seen position advanced since the previous poke, the cap
-    resets. Last-writer-wins between concurrent pokers — accepted."""
+    """After a nudge the bus accepted only: timestamp + delivery
+    counter. The counter tracks *consecutive pokes without reader
+    progress* — when the seen position advanced since the previous
+    poke, the cap resets. The reading position is the durable truth
+    the bus cannot provide (mailboxes evaporate silently), so re-arm
+    never trusts `delivered` alone. Last-writer-wins between
+    concurrent pokers — accepted."""
     now = time.time() if now is None else now
     try:
         previous = _load_poked(chat_dir, name)
@@ -615,7 +517,7 @@ def record_poke(chat_dir, name, deps, now=None):
 # The poke pass
 
 def after_send(chat_dir, sender, deps):
-    """Poke eligible receivers after a send's messages are committed.
+    """Nudge eligible receivers after a send's messages are committed.
     Never raises, never blocks beyond POKE_BUDGET, never fails the send."""
     try:
         _after_send(chat_dir, sender, deps)
@@ -694,45 +596,17 @@ def _after_send(chat_dir, sender, deps):
             # fail-closed, silently.
             window_trees[window_id] = parse_tree(out) if ok else {}
 
-        ok, _ = gate(window_trees.get(window_id, {}), mapping, own_token)
+        sessions = window_trees.get(window_id, {})
+        ok, _ = gate(sessions, mapping, own_token)
         if not ok:
             i += 1
             continue
 
         timeout = min(CTL_CALL_TIMEOUT, max(0.0, _remaining(deadline)))
-        ok, out, _ = run_ctl(ctl, [
-            "session", "text", "--lines", "10",
-            "--target", str(mapping.get("session_id")),
-            "--window", str(window_id),
-            "--pane", str(mapping.get("pane"))], timeout)
-        state = composer_state(out.splitlines()) if ok else "absent"
-        if state != "empty":
-            i += 1
-            continue
-
-        rendered = render_poke(mapping, name)
-        if rendered is None:
-            i += 1
-            continue
-        if not bytes_safe(rendered):
-            i += 1
-            continue
-        if not bang_safe(rendered):
-            i += 1
-            continue
-
-        timeout = min(CTL_CALL_TIMEOUT, max(0.0, _remaining(deadline)))
-        ok, _, _ = run_ctl(ctl, [
-            "session", "type", "--stdin",
-            "--target", str(mapping.get("session_id")),
-            "--window", str(window_id),
-            "--pane", str(mapping.get("pane"))], timeout,
-            stdin=rendered + "\n")
-        if not ok:
-            i += 1
-            continue
-
-        record_poke(chat_dir, name, deps)
+        node = sessions.get(mapping.get("session_id"))
+        delivered, _ = deliver_nudge(ctl, mapping, name, node, timeout)
+        if delivered:
+            record_poke(chat_dir, name, deps)
         i += 1
 
 
@@ -792,34 +666,11 @@ def wake(chat_dir, name, force, deps):
         print(f"error: poke refused: {reason}", file=sys.stderr)
         return 5
 
-    ok, out, _ = run_ctl(ctl, [
-        "session", "text", "--lines", "10",
-        "--target", str(mapping.get("session_id")),
-        "--window", str(window_id),
-        "--pane", str(mapping.get("pane"))], CTL_CALL_TIMEOUT)
-    state = composer_state(out.splitlines()) if ok else "absent"
-    if state != "empty":
-        print(f"error: poke refused: composer {state}", file=sys.stderr)
-        return 5
-
-    rendered = render_poke(mapping, name)
-    if rendered is None:
-        print("error: poke refused: no receiver paths in mapping",
-              file=sys.stderr)
-        return 5
-    if not bytes_safe(rendered) or not bang_safe(rendered):
-        print("error: poke refused: template guard", file=sys.stderr)
-        return 5
-
-    ok, _, err = run_ctl(ctl, [
-        "session", "type", "--stdin",
-        "--target", str(mapping.get("session_id")),
-        "--window", str(window_id),
-        "--pane", str(mapping.get("pane"))], CTL_CALL_TIMEOUT,
-        stdin=rendered + "\n")
-    if not ok:
-        print(f"error: agtermctl failed: {err.strip() or 'unknown'}",
-              file=sys.stderr)
+    node = sessions.get(mapping.get("session_id"))
+    delivered, reason = deliver_nudge(ctl, mapping, name, node,
+                                      CTL_CALL_TIMEOUT)
+    if not delivered:
+        print(f"error: poke refused: {reason}", file=sys.stderr)
         return 5
 
     record_poke(chat_dir, name, deps)  # wake counts toward the counter

@@ -42,7 +42,7 @@ python3 <A2A>/scripts/a2a_chat.py <subcommand> ...
 | `read --dir <CHAT> --name <NAME>` | Like `wait` but returns immediately (exit 3 if nothing new). The exit-3 message distinguishes the cases: an existing reading position ("already has a reading position" — if you expected a fresh name, you are ghost-reading a taken name: stop, pick another), a name that has spoken but never read ("has spoken … no reading position" — taken too), and a fresh name (chat empty, or nothing deliverable to you). |
 | `read --dir <CHAT> --all` | Print the whole conversation so far — direct messages included, marked `to <name>`. Does not mark anything seen — a later `wait`/`read` will still deliver all of it as new. Use to re-read history without moving your position. |
 | `status --dir <CHAT>` | Chat summary: topic, message count, who sent how many, plus "known readers" — names that have a reading position under `state/` but never sent, each with its last-seen time (state-file mtime). |
-| `unlink --dir <CHAT> --name <NAME>` | Stop nudging participant `NAME` in its terminal when messages wait for it (see *Nudges and unlinking a participant* below). Run **only on the human's explicit request** — never on your own initiative. Exit 3 = no nudge link existed. |
+| `unlink --dir <CHAT> --name <NAME>` | Stop nudging participant `NAME` when messages wait for it (see *Nudges and unlinking a participant* below). Run **only on the human's explicit request** — never on your own initiative. Exit 3 = no nudge link existed. |
 
 Exit codes: `0` success · `2` bad arguments · `3` nothing new (wait timed
 out, or `read` found nothing pending) · `4` `<CHAT>` is not an initialized
@@ -149,7 +149,9 @@ repeat:
 ## Nudges and unlinking a participant
 
 When messages wait for an idle participant, the chat may nudge that
-participant's terminal on its own. This is fully automatic: it needs
+participant on its own: an automatic wake-up message asking it to
+read. Not every environment can receive nudges, so a silent peer is
+not necessarily a gone peer. This is fully automatic: it needs
 nothing from you, and you should not bother with it — no checking on
 it, no investigating how it works. If it ever matters for your task,
 the human will tell you explicitly.
