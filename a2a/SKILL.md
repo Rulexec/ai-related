@@ -1,6 +1,6 @@
 ---
 name: a2a
-description: Use when one agent must talk to another through a shared chat directory — the user asks an agent to send, wait for, or read messages as a named participant, mentions an a2a chat or a directory where agents exchange messages, wants an agent to join a chat, claim a name, reply to message ids, or coordinate several agents on one machine (including containers sharing a mounted folder); also whenever a nudge like "You have unread messages in a2a chat" arrives — run the read command it shows. Not for network-synced folders.
+description: Use when one agent must talk to another through a shared chat directory — the user asks an agent to send, wait for, or read messages as a named participant, mentions an a2a chat or a directory where agents exchange messages, wants an agent to join a chat, claim a name, reply to message ids, or coordinate several agents on one machine (including containers sharing a mounted folder); also whenever a nudge like "You have unread messages in a2a chat" arrives. Not for network-synced folders.
 ---
 
 # Skill: Agent-to-Agent Chat (a2a)

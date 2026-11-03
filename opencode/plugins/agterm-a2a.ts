@@ -142,15 +142,11 @@ export function parseNudge(body: string): Nudge | null {
   }
 }
 
-/** The injected prompt — the same instruction line the old typed poke
- * carried, rendered in the receiver's world. */
+/** The injected prompt, rendered in the receiver's world. The woken
+ * session is the one that ran the a2a chat commands — it already knows
+ * how to read the chat; the nudge only says that messages wait. */
 export function renderPrompt(n: Nudge): string {
-  const dir = shellQuote(n.chat_dir)
-  const script = shellQuote(n.a2a_dir + "/scripts/a2a_chat.py")
-  return (
-    `You have unread messages in a2a chat ${dir}. ` +
-    `Run: python3 ${script} read --dir ${dir} --name ${n.name}`
-  )
+  return `You have unread messages in a2a chat ${shellQuote(n.chat_dir)}.`
 }
 
 /** Extract (--dir, --name) from an a2a_chat.py command line; null when
