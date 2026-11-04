@@ -1,0 +1,3 @@
+{
+  "plugin": ["./tui-plugin/agterm-a2a-tui.ts"]
+}

@@ -15,11 +15,18 @@
 //     chat state). This is the fence against nudges landing on an
 //     unrelated session that merely re-used the same terminal
 //     (pane-scoped mailboxes survive a program swap).
-//   • Durable binding, no live-activity guard (explicit user
-//     decision): at nudge time the binding file alone picks the
-//     wake target. If that session doesn't exist in this instance,
-//     session.prompt fails and the nudge is dropped+acked — nothing
-//     is woken.
+//   • Visibility gate (user decision 2026-11-04, reverses the old
+//     "no live-activity guard" for TUI instances): wake only when
+//     the bound session's task tree is the one the user currently
+//     views in this instance's TUI. The TUI runs in another thread,
+//     so tui-plugin/agterm-a2a-tui.ts (registered in tui.json) pub-
+//     lishes the displayed session to a per-pane route-state file
+//     (src/agterm-route-state.ts); the gate reads it here. Same task
+//     tree (same root via parentID — identical, parent vs sub-task,
+//     siblings) counts as visible. Home/plugin route → drop; differ-
+//     ent tree → drop. Missing, stale, or foreign-pid route state
+//     (headless serve, mini mode, TUI plugin absent/disabled) →
+//     fail open: deliver as before.
 //   • Busy target (session.status busy/loading) → drop+ack: a busy
 //     receiver is inside its a2a loop and re-checks the chat itself.
 //
@@ -30,6 +37,7 @@ import type { Plugin } from "@opencode-ai/plugin"
 import * as fs from "node:fs"
 import * as os from "node:os"
 import * as path from "node:path"
+import { readRouteState, sameTaskTree, visibility } from "../src/agterm-route-state"
 
 // opencode executes plugins under Bun; reach the global through
 // globalThis so the file also typechecks standalone (no ambient Bun
@@ -142,11 +150,14 @@ export function parseNudge(body: string): Nudge | null {
   }
 }
 
-/** The injected prompt, rendered in the receiver's world. The woken
- * session is the one that ran the a2a chat commands — it already knows
- * how to read the chat; the nudge only says that messages wait. */
+/** The injected prompt — a bare notification, matching the a2a skill's
+ * nudge trigger phrase. The read command line was dropped from the a2a
+ * skill (its nudge clause no longer says "run the read command it
+ * shows"); how to read is the receiver's a2a skill's business, so the
+ * payload's a2a_dir is no longer rendered. */
 export function renderPrompt(n: Nudge): string {
-  return `You have unread messages in a2a chat ${shellQuote(n.chat_dir)}.`
+  const dir = shellQuote(n.chat_dir)
+  return `You have unread messages in a2a chat ${dir}`
 }
 
 /** Extract (--dir, --name) from an a2a_chat.py command line; null when
@@ -187,9 +198,7 @@ export class Dedupe {
   }
 }
 
-/** Read chat.json's `created` token from a chat dir; null on any problem.
- * The token is the chat's creation timestamp — accident hygiene (it guards
- * against nudges for a stale or recreated chat dir), not a secret. */
+/** Read chat.json's `created` token from a chat dir; null on any problem. */
 export function readChatToken(chatDir: string): string | null {
   try {
     const data = JSON.parse(fs.readFileSync(path.join(chatDir, "chat.json"), "utf8"))
@@ -238,7 +247,7 @@ function resolveCtl(): string | null {
   }
 }
 
-export const AgtermA2A: Plugin = async ({ client }) => {
+export const AgtermA2A: Plugin = async ({ client, directory }) => {
   const ownSession = process.env.AGTERM_SESSION_ID ?? ""
   const ownPaneId = process.env.AGTERM_PANE_ID ?? ""
   const ctl = resolveCtl()
@@ -308,6 +317,29 @@ export const AgtermA2A: Plugin = async ({ client }) => {
 
   // --- nudge handling -----------------------------------------------------
 
+  /** sessionID → parentID for every session in this instance's directory;
+   * null when the listing fails (caller fails the gate open). */
+  async function fetchParentMap(): Promise<Map<string, string | undefined> | null> {
+    try {
+      const reply: unknown = await client.session.list({ query: { directory } })
+      const sessions = Array.isArray(reply)
+        ? reply
+        : Array.isArray((reply as { data?: unknown } | null)?.data)
+          ? ((reply as { data: unknown[] }).data)
+          : null
+      if (!sessions) return null
+      const map = new Map<string, string | undefined>()
+      for (const s of sessions as Array<Record<string, unknown>>) {
+        if (typeof s?.id === "string") {
+          map.set(s.id, typeof s.parentID === "string" ? s.parentID : undefined)
+        }
+      }
+      return map
+    } catch {
+      return null
+    }
+  }
+
   /** Handle one validated nudge: wake the bound session. Returns ids to
    * ack (always — every pulled message is acked exactly once). */
   async function handleNudge(n: Nudge): Promise<void> {
@@ -324,6 +356,29 @@ export const AgtermA2A: Plugin = async ({ client }) => {
     const status = sessionStatus.get(target)
     if (status === "busy" || status === "loading") {
       return // busy receiver re-checks the chat itself
+    }
+    // Visibility gate: wake only the task tree the user is currently
+    // viewing. No route knowledge (headless serve, mini, TUI plugin
+    // absent/stale) → fail open, i.e. the pre-gate behavior.
+    const verdict = visibility(target, readRouteState(ownPaneId), Date.now(), process.pid)
+    if (verdict.kind === "home") {
+      await log("info", `nudge for ${n.name}: TUI displays no session, dropped`)
+      return
+    }
+    if (verdict.kind === "session" && verdict.displayed !== target) {
+      const parentOf = await fetchParentMap()
+      if (
+        parentOf !== null &&
+        parentOf.has(target) &&
+        parentOf.has(verdict.displayed) &&
+        !sameTaskTree(target, verdict.displayed, (id) => parentOf.get(id))
+      ) {
+        await log(
+          "info",
+          `nudge for ${n.name}: bound session ${target} is in background (viewing ${verdict.displayed}), dropped`,
+        )
+        return
+      }
     }
     try {
       const result = await client.session.prompt({
