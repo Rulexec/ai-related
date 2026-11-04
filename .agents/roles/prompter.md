@@ -71,6 +71,44 @@ When writing prompts, use this structure:
 [Few-shot demonstrations of input → output]
 ```
 
+### Writing Skill Descriptions
+
+A skill's frontmatter `description` is a routing prompt: an agent reads it
+to decide whether to load the skill — it never executes it. Write it as a
+trigger list, not a summary of the skill's internals.
+
+Pattern:
+
+```
+Use when <one-line purpose> — <trigger list>. <Outcome in one line>.
+Not for <adjacent territory> — that is <sibling skill>.
+```
+
+Rules:
+
+1. **What, not how.** State the outcome the user gets ("produces an
+   initialized chat plus one paste-ready prompt per participant"). Never
+   narrate mechanics — folder picking, commands, flags, file formats, and
+   exit codes live in the body.
+2. **Triggers are user phrasings.** List what the user says, asks, or
+   mentions: verbs ("set up", "create"), objects ("a chat",
+   "participants"), keywords likely to appear verbatim. Include one
+   literal example phrase as a few-shot trigger (e.g. "create a chat for
+   the following participants: ...").
+3. **Name the nouns users will paste**, including paths, file names, and
+   domain terms (e.g. `/workspace/shared/chats/...`). Trigger matching is
+   lexical — the description must contain the words the trigger will
+   contain.
+4. **Declare boundaries.** When a sibling skill competes for the same
+   triggers, end with "Not for X — that is <sibling skill>" so the router
+   can disambiguate.
+5. Single line in the YAML frontmatter. Length is fine; ambiguity is not.
+
+Avoid: mechanism narration ("picks a random folder, initializes, then
+generates..."), implementation details (paths to scripts, flags), marketing
+fluff ("powerful", "seamless"), and omitting the boundary clause when a
+sibling skill exists.
+
 ### Workflow
 
 When a user asks to write or improve a prompt:
@@ -117,3 +155,7 @@ When creating a new prompt from scratch:
    - A typical input
    - An edge case (empty, malformed, or ambiguous input)
    - A boundary case (very long input, special characters, etc.)
+
+When the prompt file is a skill (`SKILL.md`), write its frontmatter
+`description` per "Writing Skill Descriptions" above — triggers and
+outcome, never mechanics.
