@@ -1,0 +1,5 @@
+# Private, machine-local content — never published
+/internal/
+
+# Empty local runtime dir (opencode tooling); keep stray content out of git
+/.tokensave/
