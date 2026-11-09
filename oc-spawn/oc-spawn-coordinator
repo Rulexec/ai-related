@@ -1,0 +1,524 @@
+#!/usr/bin/env python3
+"""oc-spawn-coordinator — daemon that spawns opencode companion sessions on request.
+
+Runs in a PLAIN agterm pane (not an opencode TUI pane — those panes' mailboxes
+are auto-drained by the a2a-nudge opencode plugin, which would eat requests).
+It renames its own session to "ag-a2a-coordinator", publishes its address to
+<state>/coordinator.json as a heartbeat, then loops on `agtermctl msg read
+--wait` handling "ocspawn" requests and acknowledging them.
+
+Per request entry it creates an agterm COMPANION session under the REQUESTER's
+session (--parent, --no-select, tinted blue) running an interactive opencode
+TUI whose first message is auto-submitted via the native `--prompt` flag:
+
+  zsh -ic 'opencode --prompt "$(cat <promptfile>)" ...;
+           echo "[oc-spawn] opencode exited ($rc); reconnect with:
+           opencode --continue"; exec zsh -i'
+
+Replies are written to <state>/replies/<reqid>.json plus a best-effort
+one-line agterm message to the requester's pane. See README.md for the full
+protocol.
+
+Usage:
+    oc-spawn-coordinator [--state-dir DIR] [--session-name NAME]
+                         [--opencode PATH] [--tint COLOR|none]
+
+Defaults: --state-dir $OCSPAWN_STATE_DIR (else ~/.cache/ocspawn)
+          --session-name ag-a2a-coordinator
+          --opencode resolved from PATH
+          --tint blue
+"""
+
+import argparse
+import json
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+import uuid
+
+AGTERM_TIMEOUT = 25          # per agtermctl call
+READ_WAIT_SECS = 30          # msg read --wait --timeout
+HEARTBEAT_EVERY = 20         # address-file refresh (<= client freshness window)
+MAX_ENTRIES = 64
+SLUG_MAX = 40
+
+# Entry fields rejected with a "remove the field" error: (field, why)
+REMOVED_FIELDS = (
+    ("agent", "opencode always runs with defaults"),
+    ("model", "opencode always runs with defaults"),
+    ("target", "host-only build — sessions always spawn on this machine"),
+)
+
+stop_flag = threading.Event()
+log_lock = threading.Lock()
+
+
+# ---------------------------------------------------------------- logging ---
+
+def log(msg):
+    line = f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {msg}"
+    with log_lock:
+        print(line, flush=True)
+        try:
+            with open(LOG_PATH, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except OSError:
+            pass
+
+
+# ------------------------------------------------------------- agtermctl ----
+
+def agtermctl(args, input_text=None, timeout=AGTERM_TIMEOUT):
+    """Run host agtermctl; return parsed-json-or-None plus (rc, stderr)."""
+    try:
+        p = subprocess.run(
+            [ARGS.agtermctl] + args,
+            input=input_text, capture_output=True, text=True, timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return None, 124, "agtermctl timed out"
+    except OSError as e:
+        return None, 1, str(e)
+    data = None
+    if p.stdout.strip():
+        try:
+            data = json.loads(p.stdout)
+        except ValueError:
+            data = None
+    return data, p.returncode, p.stderr.strip()
+
+
+def pane_role_of(session_id, pane_uuid):
+    """Map a pane UUID to its role (left/right/scratch) via tree, for replies."""
+    data, rc, _ = agtermctl(["window", "list", "--json"])
+    for w in (data or {}).get("result", {}).get("windows", []):
+        if not w.get("open") or not w.get("id"):
+            continue
+        tdata, _, _ = agtermctl(["tree", "--json", "--window", w["id"]])
+        tree = (tdata or {}).get("result", {}).get("tree", {})
+        for ws in tree.get("workspaces", []):
+            for s in ws.get("sessions", []):
+                if s.get("id") == session_id:
+                    for surf in s.get("surfaces", []):
+                        if surf.get("paneID") == pane_uuid and surf.get("kind"):
+                            return surf["kind"]
+    return None
+
+
+# ---------------------------------------------------- address / heartbeat ----
+
+def write_address_file():
+    obj = {
+        "name": ARGS.session_name,
+        "session": ENV["session"],
+        "pane": ENV["pane"],
+        "pid": os.getpid(),
+        "ts": time.time(),
+    }
+    tmp = ADDRESS_PATH + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(obj, f)
+        os.replace(tmp, ADDRESS_PATH)
+    except OSError as e:
+        log(f"WARN cannot write address file: {e}")
+
+
+def remove_address_file():
+    try:
+        os.unlink(ADDRESS_PATH)
+    except OSError:
+        pass
+
+
+# ----------------------------------------------------------- audit thread ----
+# Third-consumer detector: `agtermctl events` carries a
+# `message` event for every queued message. If one targets OUR pane but never
+# reaches our `msg read`, somebody else is draining this mailbox.
+
+_seen_ids = {}                 # messageID -> first-seen monotonic time
+_read_ids = set()             # messageIDs our loop actually received
+_ids_lock = threading.Lock()
+
+
+def events_audit_thread():
+    while not stop_flag.is_set():
+        try:
+            proc = subprocess.Popen(
+                [ARGS.agtermctl, "events", "--json"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                text=True, errors="replace",
+            )
+            for line in proc.stdout:
+                if stop_flag.is_set():
+                    proc.terminate()
+                    return
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    ev = json.loads(line)
+                except ValueError:
+                    continue
+                if ev.get("kind") != "message":
+                    continue
+                payload = ev.get("payload") or {}
+                if payload.get("paneID") != ENV["pane"]:
+                    continue
+                mid = payload.get("messageID")
+                if not mid:
+                    continue
+                with _ids_lock:
+                    if mid not in _seen_ids:
+                        _seen_ids[mid] = time.monotonic()
+                log(f"EVENT message {mid} queued for our pane "
+                    f"(from {payload.get('from')})")
+            proc.wait(timeout=1)
+        except (OSError, ValueError):
+            pass
+        stop_flag.wait(2)
+
+
+def heartbeat():
+    """Refresh the address file; warn about seen-but-never-read messages."""
+    write_address_file()
+    now = time.monotonic()
+    with _ids_lock:
+        for mid, first in list(_seen_ids.items()):
+            if now - first > 15 and mid not in _read_ids:
+                log(f"WARN message {mid} was queued (events) >15s ago but never "
+                    f"reached msg read — another consumer may be acking this mailbox")
+                _read_ids.add(mid)  # warn once per id
+
+
+# ------------------------------------------------------------ validation ----
+
+def slugify(text):
+    out = []
+    for ch in text.strip():
+        if ch.isalnum():
+            out.append(ch)
+        elif out and out[-1] != "-":
+            out.append("-")
+        if len(out) >= SLUG_MAX:
+            break
+    return ("oc-" + "".join(out).strip("-"))[: SLUG_MAX + 3] or "oc-session"
+
+
+def validate_removed_fields(entry):
+    for key, why in REMOVED_FIELDS:
+        if entry.get(key) is not None:
+            return f"'{key}' is no longer supported ({why}); remove the field"
+    return None
+
+
+def validate_cwd(cwd):
+    if not cwd or not isinstance(cwd, str):
+        return "missing 'cwd'"
+    if not os.path.isabs(cwd):
+        return f"cwd {cwd!r} must be absolute"
+    if not os.path.isdir(cwd):
+        return f"cwd {cwd!r} does not exist (or is not a directory)"
+    return None
+
+
+# ------------------------------------------------------------ spawning ------
+
+def write_prompt_file(reqid, index, prompt):
+    """Write the prompt text to a file the launch command can `cat`."""
+    prompts_dir = os.path.join(ARGS.state_dir, "prompts")
+    os.makedirs(prompts_dir, exist_ok=True)
+    path = os.path.join(prompts_dir, f"{reqid}-{index}.txt")
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(prompt)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+    return path
+
+
+def opencode_cmd(in_pane_prompt_file, binary):
+    # No --agent/--model: spawned opencode always runs with its defaults
+    # (change them manually in the TUI if needed).
+    return f'{binary} --prompt "$(cat {in_pane_prompt_file})"'
+
+
+def spawn_entry(index, entry, reqid, parent_session):
+    """Create one companion session; return a result dict for the reply."""
+    prompt = entry.get("prompt")
+    if not isinstance(prompt, str) or not prompt.strip():
+        return {"index": index, "ok": False, "error": "missing non-empty 'prompt'"}
+
+    name = entry.get("name") or slugify(prompt)
+    err = validate_removed_fields(entry)
+    if err:
+        return {"index": index, "ok": False, "error": err}
+
+    cwd = entry.get("cwd")
+    err = validate_cwd(cwd)
+    if err:
+        return {"index": index, "ok": False, "error": err}
+
+    prompt_file = write_prompt_file(reqid, index, prompt)
+    inner = opencode_cmd(prompt_file, ARGS.opencode)
+    # The pane stays a live shell after opencode exits, with a reconnect hint.
+    command = (
+        f"zsh -ic '{inner}; rc=$?; echo; "
+        f"echo \"[oc-spawn] opencode exited ($rc); reconnect with: "
+        f"opencode --continue\"; exec zsh -i'"
+    )
+
+    argv = [
+        "session", "new",
+        "--parent", parent_session,
+        "--no-select",
+        "--cwd", cwd,
+        "--command", command,
+        "--name", name,
+    ]
+    if ARGS.tint != "none":
+        argv += ["--tint", ARGS.tint]
+
+    data, rc, stderr = agtermctl(argv + ["--json"])
+    session_id = (((data or {}).get("result")) or {}).get("id")
+    if rc != 0 or not session_id:
+        return {"index": index, "ok": False,
+                "error": f"session new failed (rc={rc}): {stderr or data}"}
+
+    log(f"spawned [{index}] session {session_id} name={name!r} cwd={cwd}")
+    return {"index": index, "ok": True, "session": session_id, "name": name,
+            "cwd": cwd}
+
+
+# ------------------------------------------------------- request handling ----
+
+def mark_read(mid):
+    with _ids_lock:
+        _read_ids.add(mid)
+
+
+def handle_request(msg):
+    mid = msg.get("id", "?")
+    body = msg.get("body") or ""
+    req = None
+    try:
+        req = json.loads(body)
+    except ValueError:
+        pass
+    if not isinstance(req, dict) or req.get("ocspawn") != 1:
+        log(f"ignoring non-ocspawn message {mid}: {body[:80]!r}")
+        return
+
+    reqid = req.get("id") or f"req-{uuid.uuid4().hex[:12]}"
+    entries = req.get("entries")
+    sender = msg.get("from") or ""  # SESSION:PANE uuids
+    parent_session = (req.get("requester") or {}).get("session") or sender.split(":")[0]
+    reply_pane = (req.get("requester") or {}).get("pane") or (
+        sender.split(":")[1] if ":" in sender else None)
+
+    log(f"request {reqid} from {sender or 'unknown'}: "
+        f"{len(entries) if isinstance(entries, list) else 'INVALID'} entries, "
+        f"parent session {parent_session}")
+
+    results = []
+    if not isinstance(entries, list) or not entries:
+        results = [{"index": 0, "ok": False, "error": "request has no entries"}]
+    elif len(entries) > MAX_ENTRIES:
+        results = [{"index": 0, "ok": False,
+                    "error": f"too many entries ({len(entries)} > {MAX_ENTRIES})"}]
+    else:
+        for i, entry in enumerate(entries):
+            if not isinstance(entry, dict):
+                results.append({"index": i, "ok": False, "error": "entry is not an object"})
+                continue
+            try:
+                results.append(spawn_entry(i, entry, reqid, parent_session))
+            except Exception as e:  # never let one entry kill the loop
+                log(f"ERROR entry {i}: {e!r}")
+                results.append({"index": i, "ok": False, "error": f"internal: {e}"})
+
+    ok_count = sum(1 for r in results if r.get("ok"))
+    reply = {
+        "ocspawn-reply": 1,
+        "id": reqid,
+        "ok": ok_count == len(results) and bool(results),
+        "spawned": ok_count,
+        "total": len(results),
+        "results": results,
+        "coordinator": {"session": ENV["session"], "pane": ENV["pane"],
+                        "name": ARGS.session_name},
+        "ts": time.time(),
+    }
+
+    reply_path = os.path.join(ARGS.state_dir, "replies", f"{reqid}.json")
+    try:
+        tmp = reply_path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(reply, f, indent=1)
+        os.replace(tmp, reply_path)
+    except OSError as e:
+        log(f"WARN cannot write reply file {reply_path}: {e}")
+
+    if reply_pane and parent_session:
+        summary = (f"oc-spawn {reqid}: {ok_count}/{len(results)} spawned"
+                   + ("" if reply["ok"] else " (failures!)")
+                   + f". Details: {reply_path}")
+        for recipient in (f"{parent_session}:{reply_pane}",
+                          f"{parent_session}:{pane_role_of(parent_session, reply_pane) or 'left'}"):
+            data, rc, stderr = agtermctl(
+                ["msg", "send", "--stdin", "--to", recipient, "--json"],
+                input_text=summary)
+            result = (data or {}).get("result", {})
+            if rc == 0 and result.get("delivered") and not result.get("rejected"):
+                break
+            log(f"note: reply msg to {recipient} not delivered "
+                f"({stderr or result.get('rejected')}) — reply file is authoritative")
+
+    log(f"request {reqid} done: {ok_count}/{len(results)} spawned")
+
+
+# ------------------------------------------------------------- main loop -----
+
+def handle_signal(signum, _frame):
+    log(f"signal {signum} — shutting down")
+    stop_flag.set()
+    # wake the blocking read by exiting promptly; subprocesses get killed below
+
+
+def main():
+    global ARGS, ENV, ADDRESS_PATH, LOG_PATH
+
+    ap = argparse.ArgumentParser(
+        prog="oc-spawn-coordinator",
+        description="Daemon handling oc-spawn requests: spawns interactive "
+                    "opencode companion sessions on this machine.",
+    )
+    ap.add_argument("--state-dir",
+                    default=os.environ.get("OCSPAWN_STATE_DIR")
+                    or os.path.expanduser("~/.cache/ocspawn"),
+                    help="directory for coordinator state: replies/, logs/, "
+                         "prompts/, coordinator.json (default: $OCSPAWN_STATE_DIR "
+                         "or ~/.cache/ocspawn)")
+    ap.add_argument("--session-name", default="ag-a2a-coordinator")
+    ap.add_argument("--opencode", default=None,
+                    help="opencode binary (default: resolved from PATH)")
+    ap.add_argument("--tint", default="blue",
+                    choices=["red", "orange", "yellow", "green", "blue", "purple",
+                             "gray", "none"],
+                    help="tint for spawned companion sessions (default: blue)")
+    ap.add_argument("--no-rename", action="store_true",
+                    help="skip renaming this session (debug)")
+    args = ap.parse_args()
+
+    def resolve_bin(name, extra_candidates):
+        found = shutil.which(name)
+        if found:
+            return found
+        for cand in extra_candidates:
+            cand = os.path.expanduser(cand)
+            if os.path.isfile(cand) and os.access(cand, os.X_OK):
+                return cand
+        return None
+
+    args.agtermctl = resolve_bin("agtermctl", [
+        "/opt/homebrew/bin/agtermctl",
+        "/usr/local/bin/agtermctl",
+        "/Applications/agterm.app/Contents/MacOS/agtermctl",
+    ])
+    if not args.agtermctl:
+        print("fatal: agtermctl not found in PATH", file=sys.stderr)
+        sys.exit(1)
+    if not args.opencode:
+        args.opencode = resolve_bin("opencode", [
+            "~/bin/opencode",
+            "/opt/homebrew/bin/opencode",
+            "/usr/local/bin/opencode",
+            "~/.bun/bin/opencode",
+        ])
+        if not args.opencode:
+            print("fatal: opencode binary not found (pass --opencode /path/to/opencode)",
+                  file=sys.stderr)
+            sys.exit(1)
+
+    env_session = os.environ.get("AGTERM_SESSION_ID")
+    env_pane = os.environ.get("AGTERM_PANE_ID")
+    if not env_session or not env_pane:
+        print("fatal: AGTERM_SESSION_ID/AGTERM_PANE_ID not set — run me inside an "
+              "agterm terminal pane (a PLAIN one, not an opencode TUI pane, whose "
+              "mailbox is auto-drained by the a2a-nudge plugin)", file=sys.stderr)
+        sys.exit(1)
+    env = {"session": env_session, "pane": env_pane}
+    ARGS, ENV = args, env
+
+    os.makedirs(os.path.join(args.state_dir, "replies"), exist_ok=True)
+    os.makedirs(os.path.join(args.state_dir, "prompts"), exist_ok=True)
+    os.makedirs(os.path.join(args.state_dir, "logs"), exist_ok=True)
+    ADDRESS_PATH = os.path.join(args.state_dir, "coordinator.json")
+    LOG_PATH = os.path.join(args.state_dir, "logs", "coordinator.log")
+
+    log(f"coordinator starting: session={env['session']} pane={env['pane']} "
+        f"pid={os.getpid()}")
+    log(f"config: state-dir={args.state_dir} opencode={args.opencode} "
+        f"tint={args.tint}")
+
+    if not args.no_rename:
+        data, rc, stderr = agtermctl(
+            ["session", "rename", args.session_name, "--target", env_session])
+        if rc == 0:
+            log(f"session renamed to {args.session_name!r}")
+        else:
+            log(f"WARN rename failed (rc={rc}): {stderr or data}")
+
+    write_address_file()
+    log(f"address file published: {ADDRESS_PATH}")
+
+    signal.signal(signal.SIGINT, handle_signal)
+    signal.signal(signal.SIGTERM, handle_signal)
+
+    threading.Thread(target=events_audit_thread, daemon=True).start()
+
+    last_heartbeat = 0.0
+    while not stop_flag.is_set():
+        if time.monotonic() - last_heartbeat > HEARTBEAT_EVERY:
+            write_address_file()
+            heartbeat()
+            last_heartbeat = time.monotonic()
+
+        data, rc, stderr = agtermctl(
+            ["msg", "read", "--wait", "--timeout", str(READ_WAIT_SECS), "--json"])
+        if stop_flag.is_set():
+            break
+        if rc == 124:  # timed out — loop, heartbeat above refreshes address
+            continue
+        if rc != 0 or not isinstance(data, dict):
+            log(f"WARN msg read failed (rc={rc}): {stderr or data}; retrying in 2s")
+            time.sleep(2)
+            continue
+
+        messages = (data.get("result") or {}).get("messages") or []
+        for msg in messages:
+            mid = msg.get("id")
+            try:
+                handle_request(msg)
+            except Exception as e:
+                log(f"ERROR handling {mid}: {e!r}")
+            if mid:
+                _, rc2, err2 = agtermctl(["msg", "ack", mid])
+                if rc2 != 0:
+                    log(f"WARN ack {mid} failed: {err2}")
+                else:
+                    mark_read(mid)
+        if messages:
+            write_address_file()
+
+    remove_address_file()
+    log("coordinator stopped; address file removed")
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()

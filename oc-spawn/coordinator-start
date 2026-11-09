@@ -1,0 +1,6 @@
+#!/bin/sh
+# Start script for the oc-spawn coordinator. Designed to be used as the
+# agterm plain-pane command (see README.md, "Starting the coordinator");
+# args are passed through to oc-spawn-coordinator. The coordinator is
+# resolved next to this script, so the checkout location does not matter.
+exec /usr/bin/python3 "$(dirname "$0")/oc-spawn-coordinator" "$@"

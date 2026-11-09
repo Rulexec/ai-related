@@ -1,0 +1,342 @@
+#!/usr/bin/env python3
+"""oc-spawn — client for spawning opencode sessions via the oc-spawn coordinator.
+
+Sends a spawn request (one agterm message) to the oc-spawn-coordinator daemon
+and exits. Contains NO spawning logic itself — host-only: the client and every
+spawned session run on this machine.
+
+Usage:
+    oc-spawn --prompts-file prompts.jsonl [--cwd DIR]
+            [--wait-reply SECS | --no-wait-reply] [--no-address-file]
+
+Prompts file format (JSON Lines — one JSON object per line; blank lines and
+lines starting with '#' are skipped):
+
+    {"prompt": "fix the failing tests", "cwd": "/Users/me/proj"}
+    {"prompt": "summarize this repo", "cwd": "/Users/me/other", "name": "my-session"}
+
+Fields per entry:
+    prompt  (required)  initial message auto-submitted in the new opencode TUI.
+    cwd     (optional)  working directory, an absolute path on this machine.
+                        Defaults to --cwd (else the client's own cwd).
+    name    (optional)  agterm session name for the spawned companion.
+
+opencode always starts with its default agent and model; per-entry
+agent/model overrides are not supported (change them manually in the
+spawned TUI if needed).
+
+The coordinator's reply is written to <state>/replies/<reqid>.json and
+(this client, unless --no-wait-reply) polled and printed here. A one-line
+summary is additionally sent to the requesting pane's agterm mailbox — note it
+is auto-consumed if the requester is an opencode TUI pane (a2a-nudge plugin).
+<state> is $OCSPAWN_STATE_DIR (default ~/.cache/ocspawn) — the same directory
+the coordinator uses.
+
+Exit codes: 0 all entries spawned · 1 bad usage/input · 2 coordinator not
+reachable / send rejected · 3 no reply within --wait-reply · 4 some entries
+failed (see printed summary).
+"""
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+import uuid
+
+STATE_DIR = os.environ.get("OCSPAWN_STATE_DIR") or os.path.expanduser(
+    "~/.cache/ocspawn")
+COORD_NAME = "ag-a2a-coordinator"
+ADDRESS_FRESH_SECS = 180  # coordinator heartbeat window
+MAX_ENTRIES = 64
+
+# Entry fields rejected with a "remove the field" error: (field, why)
+REMOVED_FIELDS = (
+    ("agent", "opencode always runs with defaults"),
+    ("model", "opencode always runs with defaults"),
+    ("target", "host-only build — sessions always spawn on this machine"),
+)
+
+
+def die(code, msg):
+    print(f"oc-spawn: error: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def detect_state_dir():
+    """Return the state dir (created by the coordinator on first start)."""
+    if os.path.isdir(STATE_DIR):
+        return STATE_DIR
+    return None
+
+
+def run_agtermctl(args, input_text=None, timeout=25):
+    """Run agtermctl; return (rc, stdout, stderr)."""
+    binpath = shutil.which("agtermctl")
+    if not binpath:
+        return 127, "", "agtermctl not found in PATH"
+    try:
+        p = subprocess.run(
+            [binpath] + args,
+            input=input_text,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        return p.returncode, p.stdout, p.stderr
+    except subprocess.TimeoutExpired:
+        return 124, "", "agtermctl timed out"
+
+
+def try_json(text):
+    try:
+        return json.loads(text)
+    except (ValueError, TypeError):
+        return None
+
+
+def load_prompts_file(path, default_cwd):
+    """Parse the JSONL prompts file; apply the --cwd default per entry."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raw = f.read()
+    except OSError as e:
+        die(1, f"cannot read prompts file {path}: {e}")
+
+    entries = []
+    for lineno, line in enumerate(raw.splitlines(), 1):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        obj = try_json(stripped)
+        if not isinstance(obj, dict):
+            die(1, f"{path}:{lineno}: not a JSON object: {stripped[:80]!r}")
+        prompt = obj.get("prompt")
+        if not isinstance(prompt, str) or not prompt.strip():
+            die(1, f"{path}:{lineno}: missing non-empty 'prompt'")
+        entry = {"prompt": prompt}
+        cwd = obj.get("cwd", default_cwd)
+        if cwd is not None and not isinstance(cwd, str):
+            die(1, f"{path}:{lineno}: 'cwd' must be a string")
+        entry["cwd"] = cwd
+        for key, why in REMOVED_FIELDS:
+            if key in obj:
+                die(1, f"{path}:{lineno}: '{key}' is no longer supported "
+                       f"({why}); remove the field")
+        name = obj.get("name")
+        if name is not None and not isinstance(name, str):
+            die(1, f"{path}:{lineno}: 'name' must be a string")
+        if name is not None:
+            entry["name"] = name
+        entries.append(entry)
+
+    if not entries:
+        die(1, f"{path}: no prompt entries found")
+    if len(entries) > MAX_ENTRIES:
+        die(1, f"{path}: {len(entries)} entries exceeds max {MAX_ENTRIES}")
+    return entries
+
+
+def coordinator_from_address_file(state_dir):
+    """Read <state>/coordinator.json if fresh; return (session, pane)."""
+    path = os.path.join(state_dir, "coordinator.json")
+    obj = try_json(read_file(path) or "")
+    if not isinstance(obj, dict):
+        return None
+    session, pane, ts = obj.get("session"), obj.get("pane"), obj.get("ts", 0)
+    if not isinstance(session, str) or not isinstance(pane, str):
+        return None
+    try:
+        age = time.time() - float(ts)
+    except (TypeError, ValueError):
+        return None
+    if age > ADDRESS_FRESH_SECS:
+        return None  # stale heartbeat — fall back to tree scan
+    return session, pane
+
+
+def read_file(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def coordinator_from_tree():
+    """Walk open windows, find the session named ag-a2a-coordinator; return (session, pane)."""
+    rc, out, err = run_agtermctl(["window", "list", "--json"])
+    data = try_json(out) if rc == 0 else None
+    windows = (data or {}).get("result", {}).get("windows", [])
+    open_ids = [w.get("id") for w in windows if w.get("open") and w.get("id")]
+    found = []
+    for wid in open_ids:
+        rc, out, _ = run_agtermctl(["tree", "--json", "--window", wid])
+        tree = (try_json(out) or {}).get("result", {}).get("tree", {})
+        for ws in tree.get("workspaces", []):
+            for s in ws.get("sessions", []):
+                if s.get("name") == COORD_NAME and s.get("id"):
+                    pane = None
+                    for surf in s.get("surfaces", []):
+                        if surf.get("kind") == "left" and surf.get("paneID"):
+                            pane = surf["paneID"]
+                            break
+                    if pane is None:
+                        for surf in s.get("surfaces", []):
+                            if surf.get("paneID"):
+                                pane = surf["paneID"]
+                                break
+                    if pane:
+                        found.append((s["id"], pane))
+    if not found:
+        return None
+    if len(found) > 1:
+        die(2, f"multiple sessions named '{COORD_NAME}' found ({len(found)}); "
+               "close the extras or remove the stale one")
+    return found[0]
+
+
+def resolve_coordinator(state_dir, use_address_file):
+    if use_address_file:
+        addr = coordinator_from_address_file(state_dir)
+        if addr:
+            print(f"oc-spawn: coordinator found via address file "
+                  f"({addr[0][:8]}…:{addr[1][:8]}…)")
+            return addr
+    addr = coordinator_from_tree()
+    if addr:
+        print(f"oc-spawn: coordinator found via tree scan "
+              f"({addr[0][:8]}…:{addr[1][:8]}…)")
+        return addr
+    die(2, f"no '{COORD_NAME}' session found. Start it in a PLAIN agterm "
+           "pane (not an opencode TUI pane):\n"
+           "  agtermctl session new --name ag-a2a-coordinator --no-select \\\n"
+           f"    --command '/usr/bin/python3 {os.path.abspath(__file__) + '-coordinator'}'")
+
+
+def send_request(coord, body_text):
+    """Send the request message; try uuid then 'left' role. Returns delivered
+    list or None when the recipient was rejected (stale address, dead pane)."""
+    for recipient in (f"{coord[0]}:{coord[1]}", f"{coord[0]}:left"):
+        rc, out, err = run_agtermctl(
+            ["msg", "send", "--stdin", "--to", recipient, "--json"],
+            input_text=body_text)
+        data = try_json(out) if out else None
+        result = (data or {}).get("result", {})
+        delivered = result.get("delivered") or []
+        rejected = result.get("rejected") or []
+        if rc == 0 and delivered and not rejected:
+            return delivered
+        if rejected:
+            continue  # try the next recipient form, caller may re-resolve
+        die(2, f"agtermctl msg send failed (rc={rc}): {err.strip() or out.strip()}")
+    return None
+
+
+def wait_for_reply(state_dir, reqid, timeout_secs):
+    path = os.path.join(state_dir, "replies", f"{reqid}.json")
+    deadline = time.monotonic() + timeout_secs
+    while time.monotonic() < deadline:
+        obj = try_json(read_file(path) or "")
+        if isinstance(obj, dict) and obj.get("id") == reqid:
+            return obj
+        time.sleep(0.5)
+    return None
+
+
+def print_reply(reply):
+    results = reply.get("results", [])
+    ok_count = sum(1 for r in results if r.get("ok"))
+    print(f"oc-spawn: coordinator reply: {ok_count}/{len(results)} entries spawned"
+          + ("" if reply.get("ok") else " — FAILURES PRESENT"))
+    for r in results:
+        idx = r.get("index", "?")
+        if r.get("ok"):
+            print(f"  [{idx}] OK   session {r.get('session', '?')[:8]}… "
+                  f"name={r.get('name')!r} cwd={r.get('cwd')!r}")
+        else:
+            print(f"  [{idx}] FAIL {r.get('error')}")
+    return ok_count == len(results) and bool(results)
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog="oc-spawn",
+        description="Send prompt entries to the oc-spawn-coordinator; each entry "
+                    "becomes an interactive opencode companion session.",
+        epilog="Prompts file: JSON Lines of {prompt, cwd, name}; cwd is an "
+               "absolute path on this machine. See the header of this script "
+               "for details.",
+    )
+    ap.add_argument("--prompts-file", required=True,
+                    help="JSONL file of prompt entries (one JSON object per line)")
+    ap.add_argument("--cwd", default=os.getcwd(),
+                    help="default cwd for entries that omit it (default: current dir)")
+    ap.add_argument("--wait-reply", type=float, default=60, metavar="SECS",
+                    help="seconds to wait for the coordinator's reply file "
+                         "(default: 60; 0 disables)")
+    ap.add_argument("--no-wait-reply", action="store_true",
+                    help="send and exit immediately")
+    ap.add_argument("--no-address-file", action="store_true",
+                    help="skip the state-dir address file; resolve via tree scan")
+    args = ap.parse_args()
+
+    if args.no_wait_reply:
+        args.wait_reply = 0
+
+    state_dir = detect_state_dir()
+    if not state_dir:
+        die(2, f"state dir {STATE_DIR} not found — the coordinator creates it "
+               "on first start; is it running?")
+
+    entries = load_prompts_file(args.prompts_file, args.cwd)
+
+    reqid = f"req-{uuid.uuid4().hex[:12]}"
+    requester = {
+        "session": os.environ.get("AGTERM_SESSION_ID"),
+        "pane": os.environ.get("AGTERM_PANE_ID"),
+    }
+    request = {"ocspawn": 1, "id": reqid, "requester": requester, "entries": entries}
+    body = json.dumps(request, ensure_ascii=False)
+
+    if len(body.encode("utf-8")) > 60 * 1024:
+        die(1, "request body exceeds the 64 KiB agterm message limit; "
+               "split the prompts file")
+
+    coord = resolve_coordinator(state_dir, use_address_file=not args.no_address_file)
+    delivered = send_request(coord, body)
+    if delivered is None:
+        # Rejected recipients usually mean a stale address file (coordinator
+        # died without cleanup) — re-resolve from the tree and retry once.
+        print("oc-spawn: send rejected — address may be stale; re-resolving via tree…")
+        coord = coordinator_from_tree()
+        if not coord:
+            die(2, f"send rejected and no live '{COORD_NAME}' session found — "
+                   "start the coordinator (see README.md)")
+        delivered = send_request(coord, body)
+        if delivered is None:
+            die(2, f"send rejected by the coordinator at {coord[0][:8]}… "
+                   "(mailbox full?)")
+    print(f"oc-spawn: request {reqid} sent and delivered "
+          f"({len(entries)} entr{'y' if len(entries) == 1 else 'ies'}, "
+          f"message to {delivered[0][:16]}…)")
+    print(f"oc-spawn: spawned sessions appear as companions of the requesting "
+          f"session in the agterm sidebar (tinted blue).")
+
+    if args.wait_reply <= 0:
+        print("oc-spawn: not waiting for reply "
+              "(it lands in <state>/replies/ and your pane's mailbox).")
+        sys.exit(0)
+
+    reply = wait_for_reply(state_dir, reqid, args.wait_reply)
+    if reply is None:
+        die(3, f"no reply from coordinator within {args.wait_reply:.0f}s "
+               f"(request {reqid}); check {state_dir}/logs/coordinator.log")
+    ok = print_reply(reply)
+    sys.exit(0 if ok else 4)
+
+
+if __name__ == "__main__":
+    main()
