@@ -29,6 +29,13 @@
 //     fail open: deliver as before.
 //   • Busy target (session.status busy/loading) → drop+ack: a busy
 //     receiver is inside its a2a loop and re-checks the chat itself.
+//   • Garbage-ack visibility (design decision 2026-11-04):
+//     every acked non-nudge message is logged (id, sender, body preview)
+//     via client.app.log at info level — opencode panes' mailboxes are
+//     the reserved nudge channel and garbage-collect by design, so the
+//     log is the record that explains "vanishing" bus messages sent to
+//     an opencode pane. No semantic change: still pulled, still acked,
+//     never acted on.
 //
 // Everything is fail-closed and silent: this plugin must never throw
 // into opencode, block the TUI, or fail the tool call it observes.
@@ -103,10 +110,11 @@ export function eventTargetsMe(
   }
 }
 
-export type MailMessage = { id: string; body: string }
+export type MailMessage = { id: string; from: string | null; body: string }
 
 /** Parse a `msg read --json` reply into its message list; null on any
- * parse problem (caller treats it as an empty pull). */
+ * parse problem (caller treats it as an empty pull). `from` is the
+ * sender's SESSION:PANE-ID ("outside agterm" senders report null). */
 export function parseReadReply(stdout: string): MailMessage[] {
   try {
     const reply = JSON.parse(stdout)
@@ -115,13 +123,21 @@ export function parseReadReply(stdout: string): MailMessage[] {
     const out: MailMessage[] = []
     for (const m of msgs) {
       if (typeof m?.id === "string" && typeof m?.body === "string") {
-        out.push({ id: m.id, body: m.body })
+        out.push({ id: m.id, from: typeof m?.from === "string" ? m.from : null, body: m.body })
       }
     }
     return out
   } catch {
     return []
   }
+}
+
+/** One-line preview of a garbage body for the ack log: whitespace
+ * collapsed, truncated on a character boundary, ellipsis when cut. */
+export function previewBody(body: string, max = 120): string {
+  const flat = body.replace(/\s+/g, " ").trim()
+  if (flat.length <= max) return flat
+  return flat.slice(0, max - 1).trimEnd() + "…"
 }
 
 /** Parse and structurally validate an a2a-nudge body. Returns null for
@@ -413,14 +429,18 @@ export const AgtermA2A: Plugin = async ({ client, directory }) => {
         return true
       })
 
-      // 2. Dispatch: garbage (non-nudge) is acked untouched; valid
-      //    nudges are coalesced per (chat_dir, name) into one wake.
+      // 2. Dispatch: garbage (non-nudge) is acked untouched and logged
+      //    (visibility: the mailbox is the reserved nudge channel, the
+      //    log records what was collected); valid nudges are coalesced
+      //    per (chat_dir, name) into one wake.
       const wakeGroups = new Map<string, { nudge: Nudge; ids: string[] }>()
       const ackNow: string[] = []
+      const garbage: MailMessage[] = []
       for (const m of fresh) {
         const nudge = parseNudge(m.body)
         if (!nudge) {
           ackNow.push(m.id)
+          garbage.push(m)
           continue
         }
         const key = `${nudge.chat_dir}\u0000${nudge.name}`
@@ -428,7 +448,15 @@ export const AgtermA2A: Plugin = async ({ client, directory }) => {
         if (group) group.ids.push(m.id)
         else wakeGroups.set(key, { nudge, ids: [m.id] })
       }
-      if (ackNow.length > 0) await ack(ackNow)
+      if (ackNow.length > 0) {
+        await ack(ackNow)
+        for (const m of garbage) {
+          await log(
+            "info",
+            `garbage acked (reserved nudge mailbox): id=${m.id} from=${m.from ?? "outside agterm"} body="${previewBody(m.body)}"`,
+          )
+        }
+      }
 
       // 3. Wake, then ack the group after the prompt settles.
       for (const group of wakeGroups.values()) {

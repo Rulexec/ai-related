@@ -18,7 +18,12 @@ You need:
 
 - `python3` (3.9 or newer) available as `python3`
 - The path to this `a2a/` folder (below called `A2A`)
-- The chat directory (below called `CHAT`) — provided by the human
+- The chat directory (below called `CHAT`) — provided by the human as a
+  concrete **absolute path** (e.g. `/tmp/chats/fix-the-bug`). If what
+  you were handed instead looks like a template token — `$CHAT`,
+  `<CHAT>`, `%CHAT%` — it is an unsubstituted placeholder: running any
+  command with it creates a stray folder *literally named* `$CHAT`
+  under your cwd. Never do that; ask the human for the real path.
 - Your name in this chat (below called `NAME`) — provided by the human,
   e.g. `Q` or `W`. Allowed characters: letters, digits, `_`, `-`; max 32.
   Your name identifies you to the other agents; names are not enforced,
@@ -29,6 +34,14 @@ All commands are run as:
 ```
 python3 <A2A>/scripts/a2a_chat.py <subcommand> ...
 ```
+
+`<A2A>`, `<CHAT>`, `<NAME>` — every `<...>` token in this document —
+is a placeholder to **substitute before running**, never to type
+literally. A flag value still containing `$`, `<`, `>` or `%` is an
+unsubstituted placeholder: do not run the command, recover the real
+value first. Always pass an absolute path as `--dir`: a relative
+`--dir` resolves against your cwd — an arbitrary directory — so you
+can create or read a chat somewhere nobody else agreed on.
 
 ## Commands
 
@@ -74,15 +87,20 @@ printed as:
 
 ## Recipe: starting a new chat (initiator)
 
-1. `init --dir <CHAT> --topic <one-line purpose>` — if init fails with
-   "chat already initialized" (exit 5), you lost the race to another
-   initiator: continue with the participant recipe instead.
+1. `init --dir <CHAT> --topic <one-line purpose>` — `<CHAT>` is the
+   absolute path from the human; before running, check it for
+   placeholder smells (`$`, `<`, `>`, `%`) — see Setup. If init fails
+   with "chat already initialized" (exit 5), you lost the race to
+   another initiator: continue with the participant recipe instead.
 2. `claim --dir <CHAT> --name <NAME>` — take your name so joiners see
    you in `status` even before your first message lands.
-3. Send your first message with variant A (`send … --wait 120`, see the
-   conversation loop below), saying who you are, what the task is, and
-   what you expect from the others. Variant A also waits for the first
-   answers and never echoes your own message back.
+3. Send your first message with variant A (`send … --wait 120`, see
+   the conversation loop below), saying who you are, what the task is,
+   and what you expect from the others — including whether and how they
+   should reply (see Etiquette). Include the chat's absolute path and
+   each participant's name verbatim, so joiners copy real values, never
+   placeholders. Variant A also waits for the first answers and never
+   echoes your own message back.
 4. Continue with the conversation loop.
 
 ## Recipe: joining an existing chat (participant)
@@ -173,6 +191,11 @@ participant. Run it only as the human instructs:
 
 - **Reference messages you reply to**: start the body with
   `re <id>: ...` so causal order is clear even if clocks skew.
+- **State whether you want a reply.** Reading advances a position
+  silently — the sender sees nothing back — so an unstated expectation
+  strands someone in a `--wait` until timeout. If you need an answer,
+  say so ("please reply", or end with `reply?`); mark FYI/DONE-only
+  messages "no reply needed".
 - **One topic per message, keep bodies short** — long multi-topic
   messages are hard to reference, reply to, and read back.
 - **Never reply to your own messages** — if one is echoed back to you
